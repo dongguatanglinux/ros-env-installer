@@ -1359,9 +1359,11 @@ tool_config_apt_source() {
     write_root_file /etc/apt/sources.list <<EOF
 # 由 envkit.sh 生成（镜像：$mirror）
 # 变更前的原始内容备份在：${bak:-（见 /etc/apt/sources.list.*.envkit.bak）}
+# 注意：各镜像的 -security 套件与 -updates 同路径提供，无需单独域名。
+# 已实测：tsinghua/aliyun/ustc/huawei/archive 均直接服务 dists/<代号>-security/Release。
 deb ${mirror} ${DISTRO_CODENAME} main restricted universe multiverse
 deb ${mirror} ${DISTRO_CODENAME}-updates main restricted universe multiverse
-deb ${mirr//ubuntu/security} ${DISTRO_CODENAME}-security main restricted universe multiverse
+deb ${mirror} ${DISTRO_CODENAME}-security main restricted universe multiverse
 EOF
     # 备份原始 sources.list 本身
     if [[ ${DRY_RUN} -eq 0 && -f /etc/apt/sources.list ]]; then

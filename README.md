@@ -32,10 +32,11 @@ URL 直接指向 GitHub 的 raw 内容，不经过任何第三方短链服务。
 > bash envkit.sh
 > ```
 >
-> 也可以固定指纹校验后再执行（脚本变更时需重新计算）：
+> 也可以固定指纹校验后再执行（**脚本每次变更后此指纹都会改变**，需重新计算：
+> `sha256sum envkit.sh`）：
 >
 > ```bash
-> EXP=be0832fd8c242de94140260b9197b7855ca45867d6f5b313c2eda284d74c6365
+> EXP=ca3798b75c7f653c761cce4315c3573b3155bd6dca45ed3ba77af4d1e0216163
 > GOT=$(wget -qO- https://raw.githubusercontent.com/dongguatanglinux/ros-env-installer/main/envkit.sh | sha256sum | cut -d' ' -f1)
 > [ "$GOT" = "$EXP" ] && source <(wget -qO- https://raw.githubusercontent.com/dongguatanglinux/ros-env-installer/main/envkit.sh) || echo "指纹不符，已中止"
 > ```
