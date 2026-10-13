@@ -146,10 +146,12 @@ SUDO=()                   # 提权前缀，root 环境为空数组
 WORKDIR=""                 # 临时工作目录，退出时清理
 ENVKIT_HOME="${XDG_CONFIG_HOME:-$HOME/.config}/envkit"
 QUEUE_FILE="$ENVKIT_HOME/queue.txt"
+declare -a QUEUE_ITEMS=()
+QUEUE_POS=0
 LOG_FILE="${ENVKIT_LOG:-$HOME/.envkit/install-$(date +%Y%m%d-%H%M%S).log}"
 
 # 缓存的系统信息（探测后填充）
-DISTRO_ID=""; DISTRO_VERSION=""; DISTRO_CODENAME=""; DISTRO_FAMILY=""; PRETTY_NAME=""
+DISTRO_ID=""; DISTRO_VERSION=""; DISTRO_CODENAME=""; DISTRO_BASE_CODENAME=""; DISTRO_FAMILY=""; PRETTY_NAME=""
 KERNEL_ARCH=""; APT_ARCH=""; PKG_ARCH=""; IS_ARM64=0; IS_32BIT_ARMF=0
 PKG_FAMILY=""
 
@@ -290,6 +292,16 @@ detect_os() {
         PRETTY_NAME="${DISTRO_ID} ${DISTRO_VERSION}"
         warn "已通过 ROS_OS_OVERRIDE 覆盖系统信息：$DISTRO_ID $DISTRO_VERSION ($DISTRO_CODENAME)"
     fi
+
+    # 衍生版（Mint、Pop 等）的 VERSION_CODENAME 是自己的代号，
+    # ROS 与 Ubuntu 镜像仓库要的是 UBUNTU_CODENAME（jammy/noble）。
+    # 只在 ROS 源和 ROS2 判定里使用，不把衍生版伪装成 Ubuntu 去开放 ROS1。
+    if [[ -n ${ROS_OS_OVERRIDE:-} ]]; then
+        DISTRO_BASE_CODENAME=$DISTRO_CODENAME
+    else
+        DISTRO_BASE_CODENAME=$(_os_release_field UBUNTU_CODENAME) || DISTRO_BASE_CODENAME=""
+        [[ -n $DISTRO_BASE_CODENAME ]] || DISTRO_BASE_CODENAME=$DISTRO_CODENAME
+    fi
 }
 
 detect_arch() {
@@ -424,19 +436,43 @@ unsupported_ros() {
 # NVIDIA CUDA（Jetson）、grok-bot.sources 等第三方源。本脚本先整目录备份，
 # 且后续只删除自己写出的那个文件名，绝不 rm -rf 该目录。
 backup_sources_dir() {
+    # 备份必须放在 sources.list.d 外面。
+    # 旧实现把备份目录建在被拷贝的目录里，再 `cp -a "$d/." "$bak/"`，
+    # GNU cp 会因「不能把目录拷进自身」失败，调用方拿到的还混有 [成功] 提示。
     local d=/etc/apt/sources.list.d ts bak
-    [[ -d $d ]] || return 0
     ts=$(date +%Y%m%d-%H%M%S)
-    bak="$d/envkit-backup-$ts"
+    bak="/var/backups/envkit-apt-$ts"
     if (( DRY_RUN )); then
-        printf '%s[dry-run] 将备份 %s 到 %s%s\n' "$C_DIM" "$d" "$bak" "$C_OFF"
-        printf '%s' "$bak"; return 0
+        printf '%s[dry-run] 将备份 apt 源到 %s%s\n' "$C_DIM" "$bak" "$C_OFF" >&2
+        printf '%s' "$bak"
+        return 0
     fi
-    "${SUDO[@]}" mkdir -p "$bak" && "${SUDO[@]}" cp -a "$d/." "$bak/" 2>/dev/null || {
-        err "备份第三方源失败，已中止（不做任何改动）"
+    ensure_root || return 1
+    "${SUDO[@]}" mkdir -p -- "$bak/sources.list.d" || {
+        err "无法创建备份目录 $bak，已中止（不做任何改动）"
         return 1
     }
-    ok "已备份全部第三方源到 $bak"
+    if [[ -f /etc/apt/sources.list ]]; then
+        "${SUDO[@]}" cp -a /etc/apt/sources.list "$bak/sources.list" || {
+            err "备份 /etc/apt/sources.list 失败，已中止"
+            return 1
+        }
+    fi
+    if [[ -d $d ]]; then
+        local f base shopts
+        shopts=$(shopt -p nullglob dotglob)
+        shopt -s nullglob dotglob
+        for f in "$d"/*; do
+            base=$(basename -- "$f")
+            "${SUDO[@]}" cp -a "$f" "$bak/sources.list.d/$base" || {
+                eval "$shopts"
+                err "备份 $f 失败，已中止（不做任何改动）"
+                return 1
+            }
+        done
+        eval "$shopts"
+    fi
+    ok "已备份 apt 源到 $bak" >&2
     printf '%s' "$bak"
 }
 
@@ -463,9 +499,14 @@ bashrc_set_block() {
             !inblk    { print }
         ' "$rc" >"$tmp" || { rm -f "$tmp"; err "解析 $rc 失败"; return 1; }
         # 去掉尾部空行，避免每次执行都让文件增长一行。
-        # 只削尾部，不动中间，保证用户自己排版的结构不变。
-        awk 'NR > 1 { buf[NR-1] = $0 } END { n = NR; while (n > 0 && buf[n] ~ /^[[:space:]]*$/) n--; for (i = 1; i <= n; i++) print buf[i] }' \
-            "$tmp" >"$tmp.trim" 2>/dev/null && mv -f "$tmp.trim" "$tmp"
+        # 必须把最后一行也放进 buf：NR>1 时只存 buf[NR-1] 会把末行丢掉，
+        # 重复执行工具 3 会把用户 ~/.bashrc 的最后一行越删越短。
+        awk '{ buf[NR] = $0 }
+             END {
+                 n = NR
+                 while (n > 0 && buf[n] ~ /^[[:space:]]*$/) n--
+                 for (i = 1; i <= n; i++) print buf[i]
+             }' "$tmp" >"$tmp.trim" 2>/dev/null && mv -f "$tmp.trim" "$tmp"
     fi
     printf '%s\n' "$begin" >>"$tmp"
     cat >>"$tmp"
@@ -581,7 +622,7 @@ mirror_candidates() {   # $1=ros1|ros2  $2=codename
         if (( found_pref )); then
             _cands=("$PREFERRED_MIRROR" "${reordered[@]}")
         else
-            warn "指定镜像 ${PREFERRED_MIRROR} 不适用于 ${DISTRO_CODENAME}，将自动测速选择"
+            warn "指定镜像 ${PREFERRED_MIRROR} 不适用于 ${DISTRO_BASE_CODENAME}，将自动测速选择"
             PREFERRED_MIRROR=""
         fi
     fi
@@ -592,7 +633,7 @@ mirror_candidates() {   # $1=ros1|ros2  $2=codename
 probe_mirror() {   # $1=仓库根 URL
     local t
     t=$(curl -fsS -o /dev/null --max-time 3 \
-        -w '%{time_total}' "$1/dists/${DISTRO_CODENAME}/Release" 2>/dev/null) || { printf -- '-1'; return 0; }
+        -w '%{time_total}' "$1/dists/${DISTRO_BASE_CODENAME}/Release" 2>/dev/null) || { printf -- '-1'; return 0; }
     awk -v x="$t" 'BEGIN{printf "%d", (x>0 ? x*1000 : 999999)}'
 }
 
@@ -603,7 +644,7 @@ probe_mirror() {   # $1=仓库根 URL
 rank_mirrors() {   # $1=ros1|ros2
     local gen=$1 k url best="" bestms=999999999 ms
     local -a keys=()
-    while read -r k; do keys+=("$k"); done < <(mirror_candidates "$gen" "$DISTRO_CODENAME")
+    while read -r k; do keys+=("$k"); done < <(mirror_candidates "$gen" "$DISTRO_BASE_CODENAME")
     (( ${#keys[@]} )) || return 1
 
     local tmp
@@ -691,12 +732,14 @@ install_ros_keyring() {
         fi
         if ! gpg --dearmor <"$raw" >"$bin"; then
             err "  gpg 转换失败，换下一个源"
-            rm -f "$raw" "$bin"; return 1
+            rm -f "$bin"
+            continue
         fi
         # 拦下 0 字节产物——这正是鱼香脚本静默装入空密钥的那一步
         if [[ ! -s $bin ]]; then
             err "  转换结果为 0 字节，判定为失败，换下一个源"
-            rm -f "$raw" "$bin"; return 1
+            rm -f "$bin"
+            continue
         fi
 
         ensure_root || { rm -f "$raw" "$bin"; return 1; }
@@ -707,6 +750,10 @@ install_ros_keyring() {
             rm -f "$raw" "$bin"
             return 0
         fi
+        "${SUDO[@]}" mkdir -p -- /usr/share/keyrings || {
+            err "  无法创建 /usr/share/keyrings"
+            rm -f "$raw" "$bin"; return 1
+        }
         if ! "${SUDO[@]}" install -m 0644 "$bin" "$ROS_KEYRING"; then
             err "  安装到 ${ROS_KEYRING} 失败"
             rm -f "$raw" "$bin"; return 1
@@ -776,7 +823,7 @@ ros2_supported() {
         *" ubuntu "*|*" debian "*) ;;
         *) return 1 ;;
     esac
-    case $DISTRO_CODENAME in
+    case $DISTRO_BASE_CODENAME in
         jammy)              ROS2_DISTRO=humble   ;;  # LTS，2027-05 EOL
         noble)              ROS2_DISTRO=jazzy    ;;  # LTS
         focal)              ROS2_DISTRO=galactic ;;
@@ -826,7 +873,7 @@ render_menu() {
 #
 # 结果写入全局变量 CHOICE 而非通过 stdout 返回：提示语与输入同在终端，
 # 若用 choice=$(read_choice ...) 接收，提示语会被一并捕获进变量，
-# 得到 "请选择 [0-15]:0" 这样的值，导致永远匹配不上而死循环。
+# 得到 "请选择 [0-N]:0" 这样的值，导致永远匹配不上而死循环。
 CHOICE=""
 read_choice() {   # $1=提示语
     local max=${#TOOL_ORDER[@]} ans tries=0
@@ -854,7 +901,8 @@ read_choice() {   # $1=提示语
 # 导致该功能静默失效。这里使用绝对路径，且每个 id 都对当前注册表校验，
 # 遇到失效 id 就整体丢弃并明确提示，避免菜单变化后错位执行。
 queue_load() {
-    QUEUE_IDX=0
+    QUEUE_ITEMS=()
+    QUEUE_POS=0
     [[ -f $QUEUE_FILE ]] || return 1
     local line id
     while read -r line; do
@@ -863,20 +911,33 @@ queue_load() {
         if [[ -z ${TOOL_FN[$id]:-} ]]; then
             warn "队列中的工具 id=${id} 在当前版本中已不存在，已丢弃整个队列（防止错位执行）"
             rm -f "$QUEUE_FILE"
-            QUEUE_IDX=0
+            QUEUE_ITEMS=()
             return 1
         fi
-        QUEUE_IDX=$(( QUEUE_IDX + 1 ))
+        QUEUE_ITEMS+=("$id")
     done <"$QUEUE_FILE"
-    (( QUEUE_IDX > 0 ))
+    (( ${#QUEUE_ITEMS[@]} > 0 ))
 }
 
-queue_peek() {
-    (( QUEUE_IDX > 0 )) || return 1
-    sed -n "${QUEUE_IDX}p" "$QUEUE_FILE" 2>/dev/null
+# 取出下一项并写入 CHOICE。旧实现把行号设成条目总数，读到的是最后一行，
+# 而且不写 CHOICE，主循环立刻把队列清零，回放等于没发生。
+queue_next() {
+    (( QUEUE_POS < ${#QUEUE_ITEMS[@]} )) || return 1
+    CHOICE=${QUEUE_ITEMS[$QUEUE_POS]}
+    QUEUE_POS=$(( QUEUE_POS + 1 ))
+    (( DRY_RUN )) && return 0
+    local i tmp
+    tmp=$(mktemp) || return 0
+    for (( i = QUEUE_POS; i < ${#QUEUE_ITEMS[@]}; i++ )); do
+        printf '%s\n' "${QUEUE_ITEMS[$i]}" >>"$tmp"
+    done
+    if [[ -s $tmp ]]; then
+        mv -f "$tmp" "$QUEUE_FILE"
+    else
+        rm -f "$tmp" "$QUEUE_FILE"
+    fi
+    return 0
 }
-
-queue_reset() { QUEUE_IDX=0; }
 
 # 队列记录默认关闭。鱼香默认静默记录，导致用户下次运行时莫名其妙自动执行一批操作。
 queue_record() {
@@ -1018,9 +1079,9 @@ tool_install_ros() {
 
 # --------------------------- 2. rosdep ---------------------------------------
 tool_install_rosdep() {
-    [[ $PKG_FAMILY == apt ]] || { pkg_install python3-rosdep python3-rosdistro && return 0; }
-
-    if pkg_exists python3-rosdep; then
+    if [[ $PKG_FAMILY != apt ]]; then
+        pkg_install python3-rosdep python3-rosdistro || return 1
+    elif pkg_exists python3-rosdep; then
         ok "rosdep 已安装"
     else
         pkg_install python3-rosdep python3-rosdistro || return 1
@@ -1108,9 +1169,10 @@ tool_install_gazebo() {
         done
         [[ -n $distro ]] || { err "未检测到已安装的 ROS"; return 1; }
     fi
+    # Humble 及更早走 Gazebo Classic；Jazzy 起官方包名是 ros-gz。
     case $distro in
-        noetic|melodic) pkg="ros-${distro}-gazebo-ros-pkgs" ;;
-        *)             pkg="ros-${distro}-gazebo-ros-pkgs" ;;
+        jazzy|kilted|rolling|lyrical) pkg="ros-${distro}-ros-gz" ;;
+        *)                            pkg="ros-${distro}-gazebo-ros-pkgs" ;;
     esac
     if pkg_exists "$pkg"; then
         ok "$pkg 已安装，跳过"
@@ -1122,31 +1184,28 @@ tool_install_gazebo() {
 
 # --------------------------- 5. Cartographer --------------------------------
 tool_install_cartographer() {
-    [[ $PKG_FAMILY == apt ]] || { err "Cartographer 编译仅支持 Debian/Ubuntu"; return 2; }
+    [[ $PKG_FAMILY == apt ]] || { err "Cartographer 安装仅支持 Debian/Ubuntu"; return 2; }
 
-    warn "Cartographer 没有可直接安装的通用 deb 包，多数系统需要源码编译。"
-    warn "编译耗时约 30-60 分钟（取决于 CPU 核数），且需要网络拉取依赖。"
-    warn "官方 deb 仓库仅覆盖部分 Ubuntu 版本与 x86_64 架构。"
-    printf '是否继续？(yes/no): '
-    local ans; IFS= read -r ans || return 1
-    [[ $ans == yes ]] || { info "已取消"; return 0; }
+    # 旧实现克隆的是 cartographer 核心库，提示却写着 cartographer_ros，
+    # cmake 编完也不能当 ROS 包用。官方源里已有对应 deb，优先装它。
+    local distro="" d pkg
+    for d in noetic melodic humble jazzy kilted iron galactic foxy rolling lyrical; do
+        [[ -d /opt/ros/$d ]] && { distro=$d; break; }
+    done
+    [[ -n $distro ]] || { err "未检测到已安装的 ROS，请先执行工具 1"; return 1; }
 
-    pkg_install git cmake build-essential libgoogle-glog-dev libgflags-dev \
-        libatlas-base-dev libsuitesparse-dev libgoogle-glog-dev libboost-all-dev \
-        libpoco-dev python3-empy python3-lxml || return 1
-
-    local srcdir="${WORKDIR}/cartographer"
-    if (( DRY_RUN )); then
-        info "[dry-run] 将克隆源码到 $srcdir 并执行 catkin_make"
-        return 0
-    fi
-    info "正在克隆源码（首次约需数分钟）..."
-    if ! git clone --depth 1 -b 1.0 https://github.com/cartographer-project/cartographer.git "$srcdir"; then
-        err "源码克隆失败"
+    pkg="ros-${distro}-cartographer-ros"
+    if ! apt-cache show "$pkg" >/dev/null 2>&1; then
+        err "当前 apt 源没有 ${pkg}"
+        err "请先用工具 12 配好 ROS 源。本脚本不再编译 cartographer 核心库。"
         return 1
     fi
-    run "编译 cartographer_ros（耗时较长，请耐心等待）" \
-        bash -c "cd '$srcdir' && mkdir -p build && cd build && cmake .. -DCMAKE_BUILD_TYPE=Release && make -j$(nproc)"
+    if pkg_exists "$pkg"; then
+        ok "$pkg 已安装，跳过"
+        return 0
+    fi
+    pkg_install "$pkg" || return 1
+    ok "Cartographer 安装完成"
 }
 
 # --------------------------- 6. 开发基础工具 ---------------------------------
@@ -1184,9 +1243,11 @@ tool_dev_essentials() {
 # --------------------------- 7. pip 镜像 -------------------------------------
 tool_config_pip() {
     local mirror="${1:-https://pypi.tuna.tsinghua.edu.cn/simple}"
-    [[ $PKG_FAMILY == apt ]] || { pkg_install python3-pip; }
+    if [[ $PKG_FAMILY != apt ]]; then
+        pkg_install python3-pip || return 1
+    fi
     ensure_root || return 1
-    write_root_file /etc/pip.conf <<EOF
+        if ! write_root_file /etc/pip.conf <<EOF
 [global]
 index-url = ${mirror}
 trusted-host = $(printf '%s' "$mirror" | sed -E 's#^https?://([^/]+).*#\1#')
@@ -1194,6 +1255,9 @@ trusted-host = $(printf '%s' "$mirror" | sed -E 's#^https?://([^/]+).*#\1#')
 [install]
 trusted-host = $(printf '%s' "$mirror" | sed -E 's#^https?://([^/]+).*#\1#')
 EOF
+    then
+        return 1
+    fi
     ok "pip 镜像已配置：$mirror"
 }
 
@@ -1246,7 +1310,9 @@ tool_tune_inotify() {
 
     info "当前 max_user_watches = ${cur}"
     info "当前全系统已用watch 数 ≈ ${cur_usage}"
-    if (( cur_usage < cur * 80 / 100 )); then
+    if (( cur <= 0 )); then
+        warn "无法读取 max_user_watches，仍将尝试写入目标值"
+    elif (( cur_usage * 100 / cur < 80 )); then
         info "占用率未逼近上限，可稍后再执行本项"
     else
         warn "占用率已达上限的 $(( cur_usage * 100 / cur ))%，这正是 Obsidian 等报 ENOSPC 的原因"
@@ -1261,13 +1327,16 @@ tool_tune_inotify() {
     [[ $ans == yes ]] || { info "已取消"; return 0; }
 
     ensure_root || return 1
-    write_root_file /etc/sysctl.d/99-envkit-inotify.conf <<EOF
+    if ! write_root_file /etc/sysctl.d/99-envkit-inotify.conf <<EOF
 # 由 envkit.sh 生成：提升 inotify 文件监听上限
 # 背景：Obsidian / VSCode 等同时 watch 大量目录时会耗尽默认的 65536，
 #报 ENOSPC: System limit for number of file watchers reached
 fs.inotify.max_user_watches=${target}
 fs.inotify.max_user_instances=1024
 EOF
+    then
+        return 1
+    fi
     run "立即生效" "${SUDO[@]}" sysctl -p /etc/sysctl.d/99-envkit-inotify.conf || return 1
 
     local now
@@ -1307,10 +1376,16 @@ tool_config_locale() {
     ensure_root || return 1
     if command -v timedatectl >/dev/null 2>&1; then
         run "设置时区" "${SUDO[@]}" timedatectl set-timezone Asia/Shanghai || return 1
-    else
-        ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime 2>/dev/null \
+    elif (( DRY_RUN )); then
+        info "[dry-run] 将把 /etc/localtime 指向 Asia/Shanghai"
+    elif (( EUID == 0 )); then
+        ln -sfn /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
             || { err "设置时区失败"; return 1; }
-        echo "Asia/Shanghai" >/etc/timezone 2>/dev/null || true
+        printf '%s\n' "Asia/Shanghai" >/etc/timezone || true
+    else
+        "${SUDO[@]}" ln -sfn /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
+            || { err "设置时区失败"; return 1; }
+        printf '%s\n' "Asia/Shanghai" | "${SUDO[@]}" tee /etc/timezone >/dev/null || true
     fi
     ok "时区已设置为 Asia/Shanghai"
 }
@@ -1326,8 +1401,22 @@ APT_MIRRORS=(
 
 tool_config_apt_source() {
     [[ $PKG_FAMILY == apt ]] || { err "此功能仅适用于 Debian/Ubuntu 家族"; return 2; }
+    # 下面的套件名（restricted/universe/multiverse）是 Ubuntu 的。
+    # Debian 的 ID_LIKE 也会带 debian，不能靠家族判断，否则会写出无效源。
+    local archive_code=""
+    if [[ $DISTRO_ID == ubuntu ]]; then
+        archive_code=$DISTRO_CODENAME
+    else
+        archive_code=$(_os_release_field UBUNTU_CODENAME) || archive_code=""
+    fi
+    if [[ -z $archive_code ]]; then
+        err "更换 APT 源目前只支持 Ubuntu 及其衍生版（需要 UBUNTU_CODENAME）。"
+        err "Debian 的套件布局不同，请手动换源，避免写成 Ubuntu 的 restricted/universe。"
+        return 2
+    fi
 
-    warn "此操作会修改系统 apt 源。执行前会自动备份现有全部第三方源。"
+    warn "此操作会改写 /etc/apt/sources.list，并停用 ubuntu.sources / debian.sources。"
+    warn "CUDA、Docker、ROS 等第三方源会原样保留。执行前会备份到 /var/backups。"
     printf '继续？(yes/no): '
     local ans; IFS= read -r ans || return 1
     [[ $ans == yes ]] || { info "已取消"; return 0; }
@@ -1347,30 +1436,40 @@ tool_config_apt_source() {
     local bak
     bak=$(backup_sources_dir) || return 1
 
-    if [[ -n $bak && -d $bak && ${DRY_RUN} -eq 0 ]]; then
-        warn "为避免误伤，将把 sources.list.d 下原有内容移出到：$bak"
+    # 只挪开发行版自带的源文件，避免和刚写入的 sources.list 重复。
+    # 不移动 ros.list、docker.list、cuda 等第三方文件。
+    if [[ -n $bak && ${DRY_RUN} -eq 0 ]]; then
         local f
-        for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+        for f in \
+            /etc/apt/sources.list.d/ubuntu.sources \
+            /etc/apt/sources.list.d/ubuntu.list \
+            /etc/apt/sources.list.d/debian.sources \
+            /etc/apt/sources.list.d/debian.list
+        do
             [[ -e $f ]] || continue
-            "${SUDO[@]}" mv "$f" "$bak/" 2>/dev/null || true
+            "${SUDO[@]}" mv "$f" "$bak/" || {
+                err "无法停用 $f，已中止。备份在 $bak"
+                return 1
+            }
+            info "已停用 $(basename "$f")，原文件在 $bak"
         done
     fi
 
-    write_root_file /etc/apt/sources.list <<EOF
+    if ! write_root_file /etc/apt/sources.list <<EOF
 # 由 envkit.sh 生成（镜像：$mirror）
-# 变更前的原始内容备份在：${bak:-（见 /etc/apt/sources.list.*.envkit.bak）}
-# 注意：各镜像的 -security 套件与 -updates 同路径提供，无需单独域名。
-# 已实测：tsinghua/aliyun/ustc/huawei/archive 均直接服务 dists/<代号>-security/Release。
-deb ${mirror} ${DISTRO_CODENAME} main restricted universe multiverse
-deb ${mirror} ${DISTRO_CODENAME}-updates main restricted universe multiverse
-deb ${mirror} ${DISTRO_CODENAME}-security main restricted universe multiverse
+# 变更前的备份目录：${bak:-（dry-run，未创建）}
+# 各镜像的 -security 套件与 -updates 同路径提供，无需单独域名。
+deb ${mirror} ${archive_code} main restricted universe multiverse
+deb ${mirror} ${archive_code}-updates main restricted universe multiverse
+deb ${mirror} ${archive_code}-security main restricted universe multiverse
 EOF
-    # 备份原始 sources.list 本身
-    if [[ ${DRY_RUN} -eq 0 && -f /etc/apt/sources.list ]]; then
-        warn "提示：原 /etc/apt/sources.list 已覆盖，若需还原请检查 ${bak:-备份目录}"
+    then
+        return 1
     fi
-    ok "apt 源已配置为 $mirror"
-    warn "请先执行 apt update 验证新源可用，再进行其它操作"
+    ok "apt 源已配置为 $mirror（${archive_code}）"
+    if [[ ${DRY_RUN} -eq 0 ]]; then
+        warn "原文件已备份到 ${bak}。请先执行 apt update 验证新源可用"
+    fi
 }
 
 # --------------------------- 12. ROS 源专用 ----------------------------------
@@ -1383,15 +1482,20 @@ ros_repo_write() {   # $1=ros1|ros2  $2=镜像键
     if (( DRY_RUN )); then
         printf '%s[dry-run] 将写入 %s%s\n' "$C_DIM" "$dest" "$C_OFF"
     else
+        "${SUDO[@]}" mkdir -p -- /etc/apt/sources.list.d || return 1
         "${SUDO[@]}" rm -f "$dest"
     fi
-    write_root_file "$dest" <<EOF
+    if ! write_root_file "$dest" <<EOF
 # 由 envkit.sh 生成（${gen}，镜像 ${key}）——可安全删除本文件
-deb [arch=${APT_ARCH} signed-by=${ROS_KEYRING}] ${url}/ ${DISTRO_CODENAME} main
+deb [arch=${APT_ARCH} signed-by=${ROS_KEYRING}] ${url}/ ${DISTRO_BASE_CODENAME} main
 EOF
+    then
+        return 1
+    fi
     (( DRY_RUN )) && return 0
-    pkg_update >/dev/null 2>&1 || warn "apt update 出现警告，请检查网络或镜像"
-    ok "ROS 源已配置：${url} (${DISTRO_CODENAME})"
+    # 不吞掉 apt update 的输出。失败只警告：其它第三方源坏了不该阻断 ROS 源写入。
+    pkg_update || warn "apt update 出现警告，请检查网络或镜像"
+    ok "ROS 源已配置：${url} (${DISTRO_BASE_CODENAME})"
 }
 
 tool_config_ros_source() {
@@ -1439,17 +1543,35 @@ tool_install_docker() {
     local ans; IFS= read -r ans || return 1
     [[ $ans == yes ]] || { info "已取消"; return 0; }
 
+    # Debian 的 ID_LIKE 含 debian，Ubuntu 的 ID_LIKE 也含 debian，必须看 ID 本身。
+    # bash -c 是新进程，不继承 pipefail；管道最后的 tee 成功会掩盖 curl/gpg 失败。
+    local docker_os docker_code
+    if [[ $DISTRO_ID == debian ]]; then
+        docker_os=debian
+        docker_code=$DISTRO_CODENAME
+    else
+        docker_os=ubuntu
+        docker_code=$DISTRO_BASE_CODENAME
+    fi
     if (( DRY_RUN )); then
-        info "[dry-run] 将添加 Docker 官方仓库并安装 docker-ce"
+        info "[dry-run] 将添加 Docker 官方仓库（${docker_os} ${docker_code}）并安装 docker-ce"
         return 0
     fi
     run "安装 Docker 依赖" env DEBIAN_FRONTEND=noninteractive "${SUDO[@]}" \
         apt-get install -y ca-certificates curl gnupg || return 1
-    run "下载并去armor Docker 公钥" bash -c \
-        "curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor | ${SUDO[*]} tee /usr/share/keyrings/docker.gpg >/dev/null"
-    write_root_file /etc/apt/sources.list.d/docker.list <<EOF
-deb [arch=${APT_ARCH} signed-by=/usr/share/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${DISTRO_CODENAME} stable
+    run "下载并去 armor Docker 公钥" bash -c \
+        "set -o pipefail; curl -fsSL --retry 3 --max-time 30 https://download.docker.com/linux/${docker_os}/gpg | gpg --dearmor | ${SUDO[*]} tee /usr/share/keyrings/docker.gpg >/dev/null" \
+        || return 1
+    if ! "${SUDO[@]}" test -s /usr/share/keyrings/docker.gpg; then
+        err "Docker 公钥为空，已中止"
+        return 1
+    fi
+    if ! write_root_file /etc/apt/sources.list.d/docker.list <<EOF
+deb [arch=${APT_ARCH} signed-by=/usr/share/keyrings/docker.gpg] https://download.docker.com/linux/${docker_os} ${docker_code} stable
 EOF
+    then
+        return 1
+    fi
     pkg_update || return 1
     pkg_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || return 1
     ok "Docker 安装完成"
@@ -1462,6 +1584,9 @@ doctor() {
     printf '%-18s %s\n' "ID"          "$DISTRO_ID"
     printf '%-18s %s\n' "VERSION"     "$DISTRO_VERSION"
     printf '%-18s %s\n' "CODENAME"    "${DISTRO_CODENAME:-（未知）}"
+    if [[ -n $DISTRO_BASE_CODENAME && $DISTRO_BASE_CODENAME != "$DISTRO_CODENAME" ]]; then
+        printf '%-18s %s\n' "UBUNTU_CODENAME" "$DISTRO_BASE_CODENAME"
+    fi
     printf '%-18s %s\n' "ID_LIKE"     "$DISTRO_FAMILY"
     printf '%-18s %s\n' "内核架构"    "$KERNEL_ARCH"
     printf '%-18s %s\n' "apt 架构"    "${PKG_ARCH:-（无 dpkg）}"
@@ -1559,9 +1684,10 @@ tool_rollback() {
     printf '  /etc/sysctl.d/99-envkit-inotify.conf\n'
     printf '  /etc/pip.conf\n'
     printf '  ~/.bashrc 中的 [ros-env] 标记块\n'
-    printf '  apt 备份目录 /etc/apt/sources.list.d/envkit-backup-*\n'
+    printf '  旧版误放在 sources.list.d 里的备份目录 envkit-backup-*\n'
     printf '  %s\n' "$ROS_KEYRING"
-    printf '\n注意：不会删除已安装的软件包，也不会改动其它软件的配置。\n'
+    printf '\n注意：不会卸载已安装的软件包（卸载 ROS 请用菜单里的卸载项）。\n'
+    printf '      /var/backups/envkit-apt-* 会保留，那是换源前的备份。\n'
     printf '确认执行？(yes/no): '
     local ans; IFS= read -r ans || return 1
     [[ $ans == yes ]] || { info "已取消"; return 0; }
@@ -1585,6 +1711,10 @@ bashrc_remove_block() {
     local begin="# >>> ${tag} >>>" end="# <<< ${tag} <<<"
     local tmp
     [[ -f $rc ]] || return 0
+    if (( DRY_RUN )); then
+        info "[dry-run] 将移除 ~/.bashrc 中的 [$tag] 块"
+        return 0
+    fi
     tmp=$(mktemp) || return 1
     awk -v b="$begin" -v e="$end" '
         $0 == b { inblk = 1; next }
@@ -1595,6 +1725,163 @@ bashrc_remove_block() {
     ok "已移除 ~/.bashrc 中的 [$tag] 块"
 }
 
+# --------------------------- 16. 卸载 ROS ------------------------------------
+# apt 把带 * 的参数当成正则，* 只修饰前一个字符。
+# ros-humble-* 匹配的是 ros-humble 后面再跟若干个 '-'，卸不掉 ros-humble-desktop。
+# 必须写成 ^ros-humble-.* 。
+ROS_DISTRO_NAMES=(melodic noetic foxy galactic humble iron jazzy kilted rolling lyrical)
+
+_is_ros_distro_name() {
+    local n=$1 d
+    for d in "${ROS_DISTRO_NAMES[@]}"; do
+        [[ $n == "$d" ]] && return 0
+    done
+    return 1
+}
+
+installed_ros_distros() {
+    local -A seen=()
+    local d name pkg shopts
+    if [[ -d /opt/ros ]]; then
+        shopts=$(shopt -p nullglob)
+        shopt -s nullglob
+        for d in /opt/ros/*; do
+            [[ -e $d ]] || continue
+            name=$(basename -- "$d")
+            _is_ros_distro_name "$name" && seen[$name]=1
+        done
+        eval "$shopts"
+    fi
+    if [[ $PKG_FAMILY == apt ]] && command -v dpkg-query >/dev/null 2>&1; then
+        while IFS= read -r pkg; do
+            [[ $pkg =~ ^ros-([a-z]+)- ]] || continue
+            name=${BASH_REMATCH[1]}
+            _is_ros_distro_name "$name" && seen[$name]=1
+        done < <(dpkg-query -W -f='${Package}\n' 2>/dev/null || true)
+    fi
+    (( ${#seen[@]} )) || return 0
+    printf '%s\n' "${!seen[@]}" | sort
+}
+
+_bashrc_ros_distro() {
+    local rc="${HOME}/.bashrc"
+    [[ -f $rc ]] || return 1
+    awk '
+        $0 == "# >>> ros-env >>>" { inblk = 1; next }
+        $0 == "# <<< ros-env <<<" { inblk = 0; next }
+        inblk && match($0, /\/opt\/ros\/[a-z]+\//) {
+            s = substr($0, RSTART, RLENGTH)
+            sub(/^\/opt\/ros\//, "", s)
+            sub(/\/$/, "", s)
+            print s
+            exit
+        }
+    ' "$rc"
+}
+
+tool_uninstall_ros() {
+    if [[ $PKG_FAMILY != apt ]]; then
+        err "卸载 ROS 软件包仅支持 Debian/Ubuntu（apt）。"
+        return 2
+    fi
+
+    local -a distros=()
+    local line ans i distro linked
+    while IFS= read -r line; do
+        [[ -n $line ]] && distros+=("$line")
+    done < <(installed_ros_distros)
+
+    if (( ${#distros[@]} == 0 )); then
+        ok "未检测到已安装的 ROS（/opt/ros 与 ros-<发行版>-* 软件包都为空）"
+        return 0
+    fi
+
+    printf '\n%s卸载 ROS%s\n' "$C_BOLD" "$C_OFF"
+    printf '将卸载所选发行版的软件包，并删除 /opt/ros/<发行版>。\n'
+    printf '不会删除 Docker、CUDA，也不会改动其它 apt 源。\n'
+    for i in "${!distros[@]}"; do
+        printf '  %d) %s\n' "$((i + 1))" "${distros[$i]}"
+    done
+    if (( ${#distros[@]} > 1 )); then
+        printf '  a) 全部卸载\n'
+        printf '请选择 [1-%d 或 a]: ' "${#distros[@]}"
+    else
+        printf '请选择 [1]: '
+    fi
+    IFS= read -r ans || return 1
+    ans=${ans//[[:space:]]/}
+
+    local -a chosen=()
+    if [[ $ans == a || $ans == A ]]; then
+        (( ${#distros[@]} > 1 )) || { err "无效选择"; return 1; }
+        chosen=("${distros[@]}")
+    elif [[ $ans =~ ^[0-9]+$ ]] && (( ans >= 1 && ans <= ${#distros[@]} )); then
+        chosen=("${distros[$((ans - 1))]}")
+    else
+        err "无效选择"
+        return 1
+    fi
+
+    printf '即将卸载：%s\n' "${chosen[*]}"
+    printf '确认执行？apt autoremove 可能一并清掉只被这些包依赖的软件。(yes/no): '
+    IFS= read -r ans || return 1
+    [[ $ans == yes ]] || { info "已取消"; return 0; }
+
+    ensure_root || return 1
+
+    for distro in "${chosen[@]}"; do
+        _is_ros_distro_name "$distro" || { err "拒绝卸载非法发行名：$distro"; return 1; }
+        local removed=0
+        if run "卸载 ROS ${distro} 软件包" \
+            env DEBIAN_FRONTEND=noninteractive "${SUDO[@]}" \
+            apt-get purge -y "^ros-${distro}-.*"; then
+            removed=1
+        else
+            warn "apt 没有卸下 ros-${distro}-*（可能已经不在包数据库里）"
+        fi
+        if [[ -d /opt/ros/$distro ]]; then
+            run "删除 /opt/ros/${distro}" "${SUDO[@]}" rm -rf -- "/opt/ros/${distro}" || return 1
+            removed=1
+        fi
+        (( removed )) || { err "没有可卸载的内容：${distro}"; return 1; }
+        linked=$(_bashrc_ros_distro || true)
+        if [[ $linked == "$distro" ]]; then
+            bashrc_remove_block "ros-env" || return 1
+        fi
+    done
+
+    if (( DRY_RUN )); then
+        info "[dry-run] 实际执行后还会 apt-get autoremove；若系统里不再有 ROS，会询问是否删除源和公钥"
+        return 0
+    fi
+
+    run "清理不再需要的依赖" \
+        env DEBIAN_FRONTEND=noninteractive "${SUDO[@]}" apt-get autoremove -y || \
+        warn "autoremove 未完全成功，可稍后手动执行 apt-get autoremove"
+
+    local -a left=()
+    while IFS= read -r line; do
+        [[ -n $line ]] && left+=("$line")
+    done < <(installed_ros_distros)
+    if (( ${#left[@]} == 0 )); then
+        printf '系统中已没有 ROS。是否同时删除 ROS apt 源、公钥和 rosdep 默认列表？(yes/no): '
+        IFS= read -r ans || return 1
+        if [[ $ans == yes ]]; then
+            "${SUDO[@]}" rm -f \
+                /etc/apt/sources.list.d/ros.list \
+                /etc/apt/sources.list.d/ros2.list \
+                "$ROS_KEYRING" \
+                /etc/apt/trusted.gpg.d/ros.gpg \
+                /etc/ros/rosdep/sources.list.d/20-default.list
+            ok "已删除 ROS 源、公钥与 rosdep 默认源列表"
+            info "如需刷新软件索引，请执行 apt-get update"
+        fi
+    else
+        info "仍保留的 ROS：${left[*]}。apt 源与公钥未删除。"
+    fi
+    ok "ROS 卸载完成：${chosen[*]}"
+}
+
 # ==============================================================================
 # §8  工具注册表
 # ==============================================================================
@@ -1603,7 +1890,8 @@ register_all_tools() {
     register_tool 2  ros   "安装并初始化 rosdep"                        tool_install_rosdep
     register_tool 3  ros   "配置 ROS 环境变量（幂等标记块）"            tool_config_rosenv
     register_tool 4  ros   "安装 Gazebo"                                tool_install_gazebo
-    register_tool 5  ros   "编译安装 Cartographer（耗时较长）"          tool_install_cartographer
+    register_tool 5  ros   "安装 Cartographer ROS 包"                   tool_install_cartographer
+    register_tool 16 ros   "卸载已安装的 ROS（软件包与环境变量）"       tool_uninstall_ros
     register_tool 6  dev   "开发基础工具（git/cmake/gcc/python3 等）"    tool_dev_essentials
     register_tool 7  dev   "配置 pip 国内镜像源"                        tool_config_pip
     register_tool 8  dev   "配置 git 用户名与邮箱"                      tool_config_git
@@ -1769,29 +2057,34 @@ main() {
 
     new_workdir || true
 
+    local replaying=0
     if queue_load; then
-        info "检测到回放队列 $QUEUE_FILE（${QUEUE_IDX} 项），将按顺序自动执行"
+        replaying=1
+        info "检测到回放队列 $QUEUE_FILE（${#QUEUE_ITEMS[@]} 项），将按顺序自动执行"
     fi
 
     local choice fn
     while :; do
         render_menu
         # 回放队列优先；无队列时向用户读取（结果在全局 CHOICE 中）
-        if ! queue_peek; then
+        if (( replaying )) && queue_next; then
+            :
+        else
+            replaying=0
             if ! read_choice "请选择 [0-${#TOOL_ORDER[@]}]: "; then
                 ok "已退出"
                 break
             fi
         fi
         choice=$CHOICE
-        (( QUEUE_IDX > 0 )) && queue_reset
         [[ $choice == 0 ]] && { ok "已退出"; break; }
         fn=${TOOL_FN[$choice]:-}
         if [[ -z $fn ]]; then
             err "无效选项：$choice"
             continue
         fi
-        queue_record "$choice"
+        # 回放过程中再记一次会把同一条追加回去，队列永远消费不完。
+        (( replaying )) || queue_record "$choice"
         printf '\n%s>>> 执行：%s%s\n' "$C_GREEN$C_BOLD" "${TOOL_TIP[$choice]}" "$C_OFF"
         "$fn"
         printf '\n%s按 Enter 继续，或 Ctrl-C 退出%s\n' "$C_DIM" "$C_OFF"
@@ -1854,9 +2147,9 @@ if (( ENVKIT_SOURCED )); then
     # 清掉本脚本注入到用户 shell 的函数与变量，避免污染交互提示符
     unset -f ok err warn info die run write_root_file ensure_root 2>/dev/null || true
     unset DRY_RUN PREFERRED_MIRROR FIX_KEY_ONLY SUDO WORKDIR 2>/dev/null || true
-    unset DISTRO_ID DISTRO_VERSION DISTRO_CODENAME DISTRO_FAMILY PRETTY_NAME 2>/dev/null || true
+    unset DISTRO_ID DISTRO_VERSION DISTRO_CODENAME DISTRO_BASE_CODENAME DISTRO_FAMILY PRETTY_NAME 2>/dev/null || true
     unset KERNEL_ARCH APT_ARCH PKG_ARCH IS_ARM64 IS_32BIT_ARMF PKG_FAMILY 2>/dev/null || true
-    unset ENVKIT_SOURCED CHOICE QUEUE_IDX 2>/dev/null || true
+    unset ENVKIT_SOURCED CHOICE QUEUE_POS 2>/dev/null || true
     return $_main_rc 2>/dev/null || exit $_main_rc
 fi
 

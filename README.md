@@ -36,7 +36,7 @@ URL 直接指向 GitHub 的 raw 内容，不经过任何第三方短链服务。
 > `sha256sum envkit.sh`）：
 >
 > ```bash
-> EXP=ca3798b75c7f653c761cce4315c3573b3155bd6dca45ed3ba77af4d1e0216163
+> EXP=ebc6805963401b681108fb418c73616f8ccd0ccc050e049fc3c35d00ea657b0f
 > GOT=$(wget -qO- https://raw.githubusercontent.com/dongguatanglinux/ros-env-installer/main/envkit.sh | sha256sum | cut -d' ' -f1)
 > [ "$GOT" = "$EXP" ] && source <(wget -qO- https://raw.githubusercontent.com/dongguatanglinux/ros-env-installer/main/envkit.sh) || echo "指纹不符，已中止"
 > ```
@@ -63,7 +63,7 @@ chmod +x envkit.sh
 
 | 分类 | 工具 |
 |---|---|
-| ROS / 机器人 | 安装 ROS / ROS2（源 + 密钥指纹校验）、rosdep、环境变量、Gazebo、Cartographer 源码编译 |
+| ROS / 机器人 | 安装 ROS / ROS2（源 + 密钥指纹校验）、rosdep、环境变量、Gazebo、Cartographer、卸载 ROS |
 | 开发环境 | 开发基础工具（git/cmake/gcc/python3 等）、pip 国内镜像、git 用户名邮箱 |
 | 系统配置与优化 | **inotify 文件监听上限**（修复 Obsidian/VSCode 的 ENOSPC）、时区与 locale |
 | 网络与镜像 | APT 系统源更换（自动备份）、ROS 源配置 / 修复 / 切镜像 |
@@ -102,6 +102,8 @@ ARM 平台上会**重排**而非排除——国内镜像通常不含 ARM deb，�
 ### 明确区分发行版与架构
 
 - **ROS1 / ROS2 支持判定**：先看发行版 ID（衍生版用 `ID_LIKE`），再看 codename。
+  ROS 1 只对 Ubuntu 本身开放。ROS 2 在 Mint 等衍生版上使用 `UBUNTU_CODENAME`
+  （jammy/noble），而不是衍生版自己的代号。
   Ubuntu 22.04+ 装不了 ROS1（ROS1 从未为该版本发布，且已于 2025-05 停止支持），
   此时给出明确原因与替代方案，而不是让用户对着一个注定失败的菜单反复输入
 - **32 位 ARM 不做架构伪装**：如实判定并说明后果。32 位系统里不存在 arm64 仓库，
@@ -119,13 +121,14 @@ Bash 4+（需要关联数组）。CentOS 7 / RHEL 7 等自带 Bash 4.2 以下版
 
 | 发行族 | 可用功能 |
 |---|---|
-| Debian / Ubuntu（含 Mint、树莓派 OS、Jetson's L4T） | 全部 15 项 |
+| Debian / Ubuntu（含 Mint、树莓派 OS、Jetson's L4T） | 全部 16 项 |
 | Fedora / RHEL、Arch、openSUSE | 开发工具、inotify、pip、git、时区、诊断；ROS 相关功能会提示改用官方文档或容器 |
 
 ## 免责声明
 
 本脚本会修改系统配置（apt 源、bashrc、sysctl 等）。所有写操作都通过 `--dry-run` 可先预览。
-工具 15 可回滚本脚本的全部改动（不会卸载已安装的软件包）。
+工具 15 回滚本脚本写入的配置文件，不卸载软件包。
+工具 16 会卸载所选 ROS 发行版的软件包，并删除对应的 `/opt/ros/<发行版>`。
 请先理解脚本内容再使用。
 
 ## License
