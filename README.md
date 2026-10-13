@@ -7,13 +7,13 @@
 ## 一行启动
 
 ```bash
-source <(wget -qO- https://tinyurl.com/envkit)
+source <(wget -qO- https://raw.githubusercontent.com/dongguatanglinux/ros-env-installer/main/envkit.sh)
 ```
 
 或：
 
 ```bash
-source <(curl -fsSL https://tinyurl.com/envkit)
+source <(curl -fsSL https://raw.githubusercontent.com/dongguatanglinux/ros-env-installer/main/envkit.sh)
 ```
 
 执行后打开菜单，选 `0` 退出。**退出后会回到你原来的终端**，不会被关闭。
@@ -21,18 +21,29 @@ source <(curl -fsSL https://tinyurl.com/envkit)
 > 采用 `source <(...)` 而非 `bash <(...)`：后者会在子 shell 中执行，`exit` 只结束子 shell；
 > 前者在本 shell 执行，脚本已针对此做了适配（不 `exit`、还原 `set` 选项与 trap）。
 
-短链指向 GitHub 上的脚本，等价于完整地址：
+URL 直接指向 GitHub 的 raw 内容，不经过任何第三方短链服务。
 
-```
-https://raw.githubusercontent.com/dongguatanglinux/ros-env-installer/main/envkit.sh
-```
-
-若短链失效，可直接换用上面的完整地址。
+> **安全提示**：`source <(wget -qO- URL)` 的语义是「URL 返回什么就原样执行什么」，
+> 而本脚本会执行 sudo 装包、写 `/etc` 等特权操作。若在意安全，建议先下载审阅再执行：
+>
+> ```bash
+> wget -qO envkit.sh https://raw.githubusercontent.com/dongguatanglinux/ros-env-installer/main/envkit.sh
+> less envkit.sh
+> bash envkit.sh
+> ```
+>
+> 也可以固定指纹校验后再执行（脚本变更时需重新计算）：
+>
+> ```bash
+> EXP=be0832fd8c242de94140260b9197b7855ca45867d6f5b313c2eda284d74c6365
+> GOT=$(wget -qO- https://raw.githubusercontent.com/dongguatanglinux/ros-env-installer/main/envkit.sh | sha256sum | cut -d' ' -f1)
+> [ "$GOT" = "$EXP" ] && source <(wget -qO- https://raw.githubusercontent.com/dongguatanglinux/ros-env-installer/main/envkit.sh) || echo "指纹不符，已中止"
+> ```
 
 也支持下载后执行：
 
 ```bash
-curl -fsSL https://tinyurl.com/envkit -o envkit.sh
+curl -fsSL https://raw.githubusercontent.com/dongguatanglinux/ros-env-installer/main/envkit.sh -o envkit.sh
 chmod +x envkit.sh
 ./envkit.sh
 ```
