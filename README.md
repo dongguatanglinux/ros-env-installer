@@ -7,7 +7,13 @@
 ## 一行启动
 
 ```bash
-source <(curl -fsSL https://raw.githubusercontent.com/<你的用户名>/ros-env-installer/main/envkit.sh)
+source <(wget -qO- https://tinyurl.com/envkit)
+```
+
+或：
+
+```bash
+source <(curl -fsSL https://tinyurl.com/envkit)
 ```
 
 执行后打开菜单，选 `0` 退出。**退出后会回到你原来的终端**，不会被关闭。
@@ -15,10 +21,18 @@ source <(curl -fsSL https://raw.githubusercontent.com/<你的用户名>/ros-env-
 > 采用 `source <(...)` 而非 `bash <(...)`：后者会在子 shell 中执行，`exit` 只结束子 shell；
 > 前者在本 shell 执行，脚本已针对此做了适配（不 `exit`、还原 `set` 选项与 trap）。
 
-也支持直接执行（此时退出就是正常的进程退出）：
+短链指向 GitHub 上的脚本，等价于完整地址：
+
+```
+https://raw.githubusercontent.com/dongguatanglinux/ros-env-installer/main/envkit.sh
+```
+
+若短链失效，可直接换用上面的完整地址。
+
+也支持下载后执行：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<你的用户名>/ros-env-installer/main/envkit.sh -o envkit.sh
+curl -fsSL https://tinyurl.com/envkit -o envkit.sh
 chmod +x envkit.sh
 ./envkit.sh
 ```
